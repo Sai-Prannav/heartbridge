@@ -1,0 +1,645 @@
+// ============================================================================
+// Telegram channel. See docs/TELEGRAM_SETUP.md and docs/CONTRACTS.md §1.
+//
+// Responsibilities (and nothing else, no clinical logic here):
+//   1. /start <CODE>      -> store.linkChat(code, chatId), welcome in the patient's language
+//   2. text               -> store.findByChatId -> agent.handleInbound -> render replies
+//   3. button taps        -> answerCallbackQuery, lock the tapped message, handleInbound({ buttonData })
+//   4. commands           -> /checkin /help /language /voice /meds
+//   5. sendToChat()       -> used by channels/index.js for proactive check-ins, reminders, alerts
+//
+// Handlers live in buildBot() so tests can drive a bot with fake updates and a
+// transformer that swallows every API call (no network). start() is the only
+// thing that talks to Telegram for real: long polling by default (no public URL
+// needed), or a webhook when TELEGRAM_WEBHOOK_URL is set (the production path).
+// ============================================================================
+import { Bot, InlineKeyboard, InputFile } from 'grammy';
+import * as store from '../store.js';
+import { handleInbound, startCheckin } from '../core/agent.js';
+import { languages, isSupportedLanguage, enrollDemoPatient } from '../core/enroll.js';
+import { joinLinksText } from '../routes/join.js';
+import { t, localize } from '../core/i18n.js';
+import { transcribe, tts } from '../integrations/speech.js';
+import * as llm from '../core/llm/index.js';
+import * as clock from '../core/clock.js';
+import { redLock } from '../core/escalation.js';
+import * as twilio from './twilio.js';
+import * as sec from '../security.js';
+import { createRateLimiter, createDedupe, retryTransformer, describePollingError, readBodyCapped, scrub } from './resilience.js';
+
+let bot = null;
+// How updates reach this process: 'off' | 'polling' | 'webhook' | 'refused' (webhook
+// misconfigured) | 'failed' (polling died or the webhook could not be registered).
+let receiving = 'off';
+
+export const isEnabled = () => bot !== null;
+export const receiveMode = () => receiving;
+
+// Shown in Telegram's "/" menu. Spanish variants are registered for es clients.
+export const COMMANDS = {
+  en: [
+    { command: 'checkin', description: 'Start your daily heart check-in' },
+    { command: 'meds', description: 'See your medicines' },
+    { command: 'language', description: 'Change language' },
+    { command: 'voice', description: 'Turn voice replies on/off' },
+    { command: 'help', description: 'How HeartBridge works' },
+  ],
+  es: [
+    { command: 'checkin', description: 'Empezar su chequeo diario' },
+    { command: 'meds', description: 'Ver sus medicinas' },
+    { command: 'language', description: 'Cambiar idioma' },
+    { command: 'voice', description: 'Activar/desactivar respuestas de voz' },
+    { command: 'help', description: 'Cómo funciona HeartBridge' },
+  ],
+};
+
+export const escapeHtml = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+// Reply.buttons ([[{label, data}]]) -> grammY InlineKeyboard
+function toKeyboard(buttons) {
+  if (!buttons?.length) return undefined;
+  const kb = new InlineKeyboard();
+  buttons.forEach((row, i) => {
+    row.forEach((b) => kb.text(b.label, b.data));
+    if (i < buttons.length - 1) kb.row();
+  });
+  return kb;
+}
+
+// One Reply -> Telegram message(s). Urgent replies are bold + 🚨 and pinned (best effort),
+// which needs HTML mode, so the text is escaped: it can echo what the patient typed.
+// voice: the text always goes first; the audio is a bonus and can't block it.
+export async function renderReply(api, chatId, reply, { language = 'en' } = {}) {
+  const sent = await sendText(api, chatId, reply);
+  if (reply.voice) await sendVoice(api, chatId, reply.text, language);
+  return sent;
+}
+
+async function sendText(api, chatId, reply) {
+  const reply_markup = toKeyboard(reply.buttons);
+  if (!reply.urgent) return api.sendMessage(chatId, reply.text, { reply_markup });
+  const text = reply.text.startsWith('🚨') ? reply.text : `🚨 ${reply.text}`;
+  const sent = await api.sendMessage(chatId, `<b>${escapeHtml(text)}</b>`, { parse_mode: 'HTML', reply_markup });
+  await api.pinChatMessage(chatId, sent.message_id).catch(() => {}); // not allowed in every chat
+  return sent;
+}
+
+async function sendVoice(api, chatId, text, language) {
+  const audio = await tts(text, language);
+  if (!audio) return;
+  try {
+    if (audio.buffer) return await api.sendAudio(chatId, new InputFile(audio.buffer, 'heartbridge.mp3'));
+    try {
+      return await api.sendAudio(chatId, audio.url); // Telegram fetches it itself
+    } catch {
+      // Telegram couldn't fetch the URL (blocked/slow): download and upload it ourselves.
+      const res = await fetch(audio.url, { signal: AbortSignal.timeout(20_000) });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await api.sendAudio(chatId, new InputFile(Buffer.from(await res.arrayBuffer()), 'heartbridge.mp3'));
+    }
+  } catch (err) {
+    console.error('[telegram] voice reply failed:', scrub(err));
+  }
+}
+
+export async function sendToChat(chatId, reply, opts) {
+  if (!bot) throw new Error('Telegram bot not started');
+  return renderReply(bot.api, chatId, reply, opts);
+}
+
+// Telegram bots can download files up to 20 MB; we cap lower to keep memory and uploads sane.
+export const MAX_FILE_BYTES = 8 * 1024 * 1024;
+
+export class FileTooLargeError extends Error {}
+
+// 'HeartBridge is typing…' while the core (and maybe an AI call) works on the reply, so the
+// chat never looks frozen. Fire-and-forget: it must not delay or break the reply.
+function typing(ctx) {
+  Promise.resolve()
+    .then(() => ctx.replyWithChatAction('typing'))
+    .catch(() => {});
+}
+
+// Download an incoming file (voice note, photo) into a Buffer.
+async function downloadFile(ctx, declaredSize) {
+  if (declaredSize > MAX_FILE_BYTES) throw new FileTooLargeError();
+  const file = await ctx.getFile();
+  if (file.file_size > MAX_FILE_BYTES) throw new FileTooLargeError();
+  const res = await fetch(`https://api.telegram.org/file/bot${ctx.api.token}/${file.file_path}`, { signal: AbortSignal.timeout(30_000) });
+  if (!res.ok) throw new Error(`file download HTTP ${res.status}`);
+  const buffer = await readBodyCapped(res, MAX_FILE_BYTES); // stops reading at the cap
+  if (!buffer) throw new FileTooLargeError();
+  return buffer;
+}
+
+// Test hook: make sendToChat() use a bot built by buildBot() without polling.
+export function useBot(b) {
+  bot = b;
+  receiving = 'off';
+  seenUpdates.reset();
+}
+
+// Language for someone we can't identify yet: Telegram tells us the app's language.
+const guessLang = (ctx) => (isSupportedLanguage(ctx.from?.language_code?.slice(0, 2)) ? ctx.from.language_code.slice(0, 2) : 'en');
+
+const langOf = (link) => (link.role === 'caregiver' ? link.patient.caregiver?.language ?? 'en' : link.patient.language);
+
+// t() + LLM translation for languages without built-in strings (falls back to English).
+const say = async (lang, key, vars) => localize(lang, t(lang, key, vars));
+
+const firstName = (patient) => patient.name.split(' ')[0];
+
+// Messages that don't go through handleInbound still belong in the dashboard log.
+function logOut(link, reply) {
+  store.addMessage({
+    patientId: link.patient.id,
+    direction: 'out',
+    to: link.role,
+    text: reply.text,
+    textEn: reply.textEn,
+    buttons: reply.buttons,
+    channel: 'telegram',
+  });
+}
+
+async function replyAll(ctx, link, replies) {
+  const voice = link.role === 'patient' && Boolean(link.patient.voiceMode);
+  for (const r of replies) await renderReply(ctx.api, ctx.chat.id, { ...r, voice: r.voice || voice }, { language: langOf(link) });
+}
+
+async function welcome(ctx, link) {
+  const lang = langOf(link);
+  const key = link.role === 'caregiver' ? 'welcome_caregiver' : 'welcome_patient';
+  const reply = { text: await say(lang, key, { name: firstName(link.patient) }), textEn: t('en', key, { name: firstName(link.patient) }) };
+  logOut(link, reply);
+  await renderReply(ctx.api, ctx.chat.id, reply);
+}
+
+// Best-effort nudge to the nurse group. Imported lazily: channels/index.js imports this file.
+function notifyNurses(text) {
+  import('./index.js').then((c) => c.sendToNurses({ text })).catch(() => {});
+}
+
+// Drop every existing link for this chat (patient or caregiver) before it links to someone else.
+function unlinkChat(chatId) {
+  for (let link = store.findByChatId(chatId); link; link = store.findByChatId(chatId)) {
+    const { patient } = link;
+    if (link.role === 'caregiver') store.updatePatient(patient.id, { caregiver: { ...patient.caregiver, chatId: null } });
+    else store.updatePatient(patient.id, { chatId: null });
+  }
+}
+
+// The latest link wins: linking here also moves proactive messages (check-ins, reminders)
+// to Telegram, the same way JOIN over SMS does in routes/webhooks.js. The phone stays as a fallback.
+function preferTelegram({ role, patient }) {
+  if (role === 'caregiver') store.updatePatient(patient.id, { caregiver: { ...patient.caregiver, channel: 'telegram' } });
+  else store.updatePatient(patient.id, { channel: 'telegram' });
+}
+
+// The /language picker. Two per row keeps native names readable on a phone.
+function languageButtons() {
+  const buttons = languages().map((l) => ({ label: l.nativeName, data: `lang:${l.code}` }));
+  const rows = [];
+  for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
+  return rows;
+}
+
+async function setLanguage(ctx, link, code) {
+  const { patient } = link;
+  if (link.role === 'caregiver') store.updatePatient(patient.id, { caregiver: { ...patient.caregiver, language: code } });
+  else store.updatePatient(patient.id, { language: code });
+  const name = languages().find((l) => l.code === code).nativeName;
+  const reply = { text: await say(code, 'language_set', { language: name }), textEn: t('en', 'language_set', { language: name }) };
+  logOut(link, reply);
+  await renderReply(ctx.api, ctx.chat.id, reply);
+}
+
+// After a tap: remove the keyboard and show what was picked, so it can't be tapped twice.
+async function lockTappedMessage(ctx) {
+  const msg = ctx.callbackQuery.message;
+  if (!msg?.text) return;
+  const data = ctx.callbackQuery.data;
+  const label = msg.reply_markup?.inline_keyboard?.flat().find((b) => b.callback_data === data)?.text;
+  await ctx
+    .editMessageText(label ? `${msg.text}\n\n→ ${label}` : msg.text, { reply_markup: { inline_keyboard: [] } })
+    .catch(() => {}); // message too old / unchanged: harmless
+}
+
+// For the nurse group's /status: is everything the demo needs actually up?
+export function statusText() {
+  const ai = llm.status();
+  const patients = store.listPatients();
+  const linked = patients.filter((p) => p.chatId || p.phone).length;
+  const up = Math.round(process.uptime());
+  const uptime = `${Math.floor(up / 3600)}h ${Math.floor((up % 3600) / 60)}m`;
+  const on = (x) => (x ? '✅' : '—');
+  return [
+    '🩺 HeartBridge status',
+    `Uptime: ${uptime}`,
+    `LLM: ${ai.provider}${ai.model ? ` (${ai.model})` : ''}${ai.available === false ? ' (unavailable)' : ''}`,
+    `Linked patients: ${linked} of ${patients.length}`,
+    `Channels: Telegram ${on(true)} · SMS ${on(twilio.sms.isEnabled())} · WhatsApp ${on(twilio.whatsapp.isEnabled())}`,
+    `Demo clock: ${clock.nowISO()}`,
+  ].join('\n');
+}
+
+// rateLimit: { limit, windowMs } per private chat, or false to disable.
+export function buildBot(token, { botInfo, rateLimit = { limit: 20, windowMs: 60_000 } } = {}) {
+  const b = new Bot(token, botInfo ? { botInfo } : undefined);
+  b.api.config.use(retryTransformer({ jitterMs: 250 }));
+  const seenGroups = new Set();
+  const limiter = rateLimit ? createRateLimiter(rateLimit) : null;
+  const throttled = new Set();
+
+  // A stuck key or a spammer shouldn't flood the core (or the LLM bill). Over the limit the
+  // update is dropped; taps are still answered so the button stops spinning.
+  b.use(async (ctx, next) => {
+    if (!limiter || ctx.chat?.type !== 'private') return next();
+    if (limiter.hit(ctx.chat.id)) {
+      throttled.delete(ctx.chat.id);
+      return next();
+    }
+    if (!throttled.has(ctx.chat.id)) {
+      throttled.add(ctx.chat.id);
+      console.warn(`[telegram] chat ${ctx.chat.id} is over ${rateLimit.limit} messages/${rateLimit.windowMs / 1000}s, dropping until it slows down`);
+      // What is dropped is never read, so it could have been "I can't breathe" from someone
+      // typing in a panic. Say once per burst what to do in an emergency, and leave a trace.
+      const link = store.findByChatId(ctx.chat.id);
+      await ctx.reply(await say(link ? langOf(link) : guessLang(ctx), 'safety_net_911')).catch(() => {});
+      if (link) store.audit('rate_limited', link.patient.id, { channel: 'telegram', role: link.role, limit: rateLimit.limit, windowMs: rateLimit.windowMs });
+    }
+    if (ctx.callbackQuery) await ctx.answerCallbackQuery().catch(() => {});
+  });
+
+  // Group chats: log the id once so people can find NURSE_CHAT_ID.
+  b.use(async (ctx, next) => {
+    if (ctx.chat && ctx.chat.type !== 'private' && !seenGroups.has(ctx.chat.id)) {
+      seenGroups.add(ctx.chat.id);
+      console.log(`[telegram] group chat "${ctx.chat.title ?? ''}" id=${ctx.chat.id} (use as NURSE_CHAT_ID)`);
+    }
+    return next();
+  });
+
+  // Groups only get nurse-side commands; a group is never treated as a patient.
+  const group = b.chatType(['group', 'supergroup']);
+  // Closed by default: until NURSE_CHAT_ID names the group, no group may run /demo or /status
+  // (any group the bot is added to would otherwise learn patient counts and demo links).
+  const isNurseGroup = (ctx) => !!process.env.NURSE_CHAT_ID && String(ctx.chat.id) === String(process.env.NURSE_CHAT_ID);
+
+  // /demo: the judge-mode join links, so the nurse group can share them on the spot.
+  group.command('demo', async (ctx) => {
+    if (!isNurseGroup(ctx)) return;
+    await ctx.reply(joinLinksText(), { link_preview_options: { is_disabled: true } });
+  });
+
+  group.command('status', async (ctx) => {
+    if (!isNurseGroup(ctx)) return;
+    await ctx.reply(statusText());
+  });
+
+  const dm = b.chatType('private');
+
+  // --- Linking: t.me/<bot>?start=GARCIA1 arrives as "/start GARCIA1" ---
+  dm.command('start', async (ctx) => {
+    const code = ctx.match?.trim() ?? '';
+    if (!code) {
+      const existing = store.findByChatId(ctx.chat.id);
+      if (existing) return welcome(ctx, existing);
+      return ctx.reply(t(guessLang(ctx), 'unknown_code'));
+    }
+
+    // Judge mode: /start DEMO or /start DEMO_ES -> a fresh Maria clone, straight into a check-in.
+    const demo = code.match(/^DEMO(?:_([A-Za-z]{2}))?$/i);
+    if (demo) {
+      unlinkChat(ctx.chat.id);
+      const patient = enrollDemoPatient({ chatId: ctx.chat.id, language: demo[1]?.toLowerCase() ?? guessLang(ctx) });
+      const link = { role: 'patient', patient };
+      await welcome(ctx, link);
+      const replies = await startCheckin(patient.id);
+      for (const r of replies) logOut(link, r);
+      return replyAll(ctx, link, replies);
+    }
+
+    const throttleKey = `tg:${ctx.chat.id}`;
+    if (sec.joinBlocked(throttleKey)) return ctx.reply(t(guessLang(ctx), 'unknown_code')); // no hint that it's throttled
+    const isCg = /^CG_/i.test(code);
+    const target = store.getPatientByCode(code.replace(/^CG_/i, ''));
+    if (!target) {
+      sec.joinMissed(throttleKey);
+      return ctx.reply(t(guessLang(ctx), 'unknown_code'));
+    }
+    // A linked slot can't be taken over by another chat (the code is not a master key): tell the
+    // sender, leave a trace, and let the nurse group know. A nurse releases it from the dashboard.
+    const holder = isCg ? target.caregiver?.chatId : target.chatId;
+    if (!sec.canClaim(holder, ctx.chat.id)) {
+      store.audit('link_refused', target.id, { channel: 'telegram', role: isCg ? 'caregiver' : 'patient' });
+      notifyNurses(`⚠️ Someone tried to link ${target.name}'s ${isCg ? 'caregiver' : 'patient'} code from a second Telegram chat. It was refused; release the link from the dashboard if the patient got a new phone.`);
+      return ctx.reply(t(guessLang(ctx), 'code_in_use'));
+    }
+    unlinkChat(ctx.chat.id); // one chat = one person; re-linking moves it
+    const link = store.linkChat(code, ctx.chat.id);
+    preferTelegram(link);
+    store.audit('channel_link', link.patient.id, { channel: 'telegram', role: link.role });
+    await welcome(ctx, link);
+  });
+
+  // Everything below needs a linked chat.
+  const linked = (handler) => async (ctx) => {
+    const link = store.findByChatId(ctx.chat.id);
+    if (!link) return ctx.reply(t(guessLang(ctx), 'unknown_code'));
+    return handler(ctx, link);
+  };
+
+  dm.command('help', linked(async (ctx, link) => ctx.reply(await say(langOf(link), 'help'))));
+
+  dm.command(
+    'checkin',
+    linked(async (ctx, link) => {
+      if (link.role !== 'patient') return ctx.reply(await say(langOf(link), 'help'));
+      const replies = await startCheckin(link.patient.id);
+      for (const r of replies) logOut(link, r);
+      await replyAll(ctx, link, replies);
+    }),
+  );
+
+  dm.command(
+    'language',
+    linked(async (ctx, link) => {
+      await ctx.reply(await say(langOf(link), 'language_prompt'), { reply_markup: toKeyboard(languageButtons()) });
+    }),
+  );
+
+  dm.command(
+    'voice',
+    linked(async (ctx, link) => {
+      if (link.role !== 'patient') return ctx.reply(await say(langOf(link), 'help'));
+      const on = !link.patient.voiceMode;
+      store.updatePatient(link.patient.id, { voiceMode: on });
+      await ctx.reply(await say(link.patient.language, on ? 'voice_on' : 'voice_off'));
+    }),
+  );
+
+  dm.command(
+    'meds',
+    linked(async (ctx, link) => {
+      const meds = link.patient.meds ?? [];
+      const lines = meds.map((m) => `💊 ${[m.name, m.dose].filter(Boolean).join(' ')}${m.times?.length ? ` (${m.times.join(', ')})` : ''}`);
+      await ctx.reply(lines.length ? lines.join('\n') : '—');
+    }),
+  );
+
+  // --- Free text (patient or caregiver) ---
+  const onText = linked(async (ctx, link) => {
+    typing(ctx);
+    const replies = await handleInbound({ patientId: link.patient.id, role: link.role, channel: 'telegram', text: ctx.msg.text });
+    await replyAll(ctx, link, replies);
+  });
+  dm.on('message:text', onText);
+  // An edit is the person speaking again: "estoy bien" corrected to "me duele el pecho" used to be
+  // ignored, because Telegram delivers it as edited_message and nothing listened for that. The new
+  // text is read like a fresh message. Commands are the exception (an edited /voice must not toggle twice).
+  dm.on('edited_message:text', async (ctx, next) => (ctx.msg.text.startsWith('/') ? undefined : next()), onText);
+
+  // --- Voice notes: transcribe, show what we heard, then treat it like typed text ---
+  dm.on(
+    ['message:voice', 'message:audio'],
+    linked(async (ctx, link) => {
+      const lang = langOf(link);
+      const media = ctx.message.voice ?? ctx.message.audio;
+      let transcript = null;
+      try {
+        const audio = await downloadFile(ctx, media.file_size);
+        transcript = await transcribe(audio, media.mime_type ?? 'audio/ogg', lang);
+      } catch (err) {
+        if (err instanceof FileTooLargeError) return ctx.reply(await say(lang, 'file_too_large'));
+        console.error('[telegram] voice download failed:', scrub(err));
+      }
+      if (!transcript) return unheard(ctx, link);
+      await ctx.reply(t(lang, 'heard', { text: transcript }));
+      typing(ctx);
+      const replies = await handleInbound({ patientId: link.patient.id, role: link.role, channel: 'telegram', voiceTranscript: transcript });
+      await replyAll(ctx, link, replies);
+    }),
+  );
+
+  // --- Photos (med bottles, discharge papers): hand the core base64, it decides what to do ---
+  const onImage = (pick) =>
+    linked(async (ctx, link) => {
+      const lang = langOf(link);
+      const to = { patientId: link.patient.id, role: link.role, channel: 'telegram' };
+      // The words under a photo are the person speaking, so they are read first, as a message of
+      // their own ("me duele el pecho" under a picture used to get "thanks for the photo"). If
+      // they are an emergency, the 911 reply stands alone.
+      const caption = ctx.message.caption?.trim();
+      if (caption) {
+        typing(ctx);
+        const said = await handleInbound({ ...to, text: caption });
+        await replyAll(ctx, link, said);
+        if (said.some((r) => r.urgent)) return;
+      }
+      const { size, mime } = pick(ctx.message);
+      let buffer;
+      try {
+        buffer = await downloadFile(ctx, size);
+      } catch (err) {
+        if (err instanceof FileTooLargeError) return ctx.reply(await say(lang, 'file_too_large'));
+        console.error('[telegram] photo download failed:', scrub(err));
+        return ctx.reply(await say(lang, 'photo_failed'));
+      }
+      const photo = { base64: buffer.toString('base64'), mime };
+      typing(ctx);
+      const replies = await handleInbound({ ...to, photo });
+      await replyAll(ctx, link, replies);
+    });
+
+  // Telegram sends several sizes of the same photo, smallest first; ctx.getFile() fetches the largest.
+  dm.on('message:photo', onImage((m) => ({ size: m.photo.at(-1).file_size, mime: 'image/jpeg' })));
+  // Photos sent "as file" keep full quality and arrive as documents. Any other file falls through
+  // to the catch-all at the end.
+  dm.on('message:document').filter(
+    (ctx) => Boolean(ctx.message.document.mime_type?.startsWith('image/')),
+    onImage((m) => ({ size: m.document.file_size, mime: m.document.mime_type })),
+  );
+
+  // --- Inline button taps ---
+  dm.on('callback_query:data', async (ctx) => {
+    // A tap can outlive its query (bot restarted, a slow reply before it): Telegram then
+    // rejects the answer, but the patient's choice still has to count.
+    await ctx.answerCallbackQuery().catch(() => {});
+    const link = store.findByChatId(ctx.chat.id);
+    if (!link) return;
+    await lockTappedMessage(ctx);
+    const data = ctx.callbackQuery.data;
+    const lang = data.startsWith('lang:') ? data.slice(5) : null;
+    if (lang && isSupportedLanguage(lang)) return setLanguage(ctx, link, lang);
+    const replies = await handleInbound({ patientId: link.patient.id, role: link.role, channel: 'telegram', buttonData: data });
+    await replyAll(ctx, link, replies);
+  });
+
+  // --- Everything else a person can send (must stay last) ---
+  // A video note (the mic button becomes a camera with one tap), a sticker, a location, a PDF:
+  // none of them can be read, and they used to get silence. The core is told that something
+  // arrived, so the person gets an answer (the current question again, or "call 911" during a RED
+  // lock) and the nurse sees it in the conversation. Words under a video are read as words.
+  const unreadableKind = (ctx) => UNREADABLE.find(([field]) => ctx.message[field] !== undefined);
+  dm.on(
+    'message',
+    // A service message (a pin, an auto-delete timer): nobody said anything, linked or not.
+    async (ctx, next) => (unreadableKind(ctx) ? next() : undefined),
+    linked(async (ctx, link) => {
+      const kind = unreadableKind(ctx);
+      typing(ctx);
+      const text = ctx.message.caption?.trim() || kind[1];
+      const replies = await handleInbound({ patientId: link.patient.id, role: link.role, channel: 'telegram', text });
+      await replyAll(ctx, link, replies);
+    }),
+  );
+
+  b.catch((err) => console.error('[telegram] error:', scrub(err.error?.message ?? err)));
+  return b;
+}
+
+// Message content no handler above can read -> how it is shown in the conversation log.
+const UNREADABLE = [
+  ['video_note', '[video note]'],
+  ['video', '[video]'],
+  ['animation', '[GIF]'],
+  ['sticker', '[sticker]'],
+  ['document', '[file]'],
+  ['location', '[location]'],
+  ['venue', '[location]'],
+  ['contact', '[contact]'],
+  ['poll', '[poll]'],
+  ['dice', '[dice]'],
+  ['story', '[story]'],
+];
+
+// A voice note nobody could transcribe (no speech key, a failed download, silence). The person is
+// asked to type, and because nobody heard what they said, told what to do in an emergency. The
+// exchange is logged so the nurse sees that they tried. During a RED lock the core answers
+// instead: "call 911" again, and the attempt goes onto the RED alert.
+async function unheard(ctx, link) {
+  const lang = langOf(link);
+  const shown = '[voice note]';
+  if (redLock(link.patient)) {
+    return replyAll(ctx, link, await handleInbound({ patientId: link.patient.id, role: link.role, channel: 'telegram', text: shown }));
+  }
+  store.addMessage({ patientId: link.patient.id, direction: 'in', from: link.role, to: link.role, text: shown, channel: 'telegram' });
+  const reply = {
+    text: `${await say(lang, 'voice_unavailable')}\n\n${await say(lang, 'safety_net_911')}`,
+    textEn: `${t('en', 'voice_unavailable')}\n\n${t('en', 'safety_net_911')}`,
+  };
+  logOut(link, reply);
+  await renderReply(ctx.api, ctx.chat.id, reply);
+}
+
+// ---------- webhook mode (the production path) ----------
+// Long polling needs nothing public and is the default. A webhook is what a real deployment
+// runs: no connection held open, several instances behind one address, and Telegram re-sends
+// whatever we did not acknowledge. It also makes this an endpoint anyone can post to, so every
+// request must carry the secret we registered (header X-Telegram-Bot-Api-Secret-Token).
+export const WEBHOOK_PATH = '/webhooks/telegram';
+const SECRET_FORMAT = /^[A-Za-z0-9_-]{1,256}$/; // Telegram's rule for secret_token
+// The only update types the handlers use (edited_message: a corrected message is read again;
+// my_chat_member: the bot was added to a group, which is when its id gets logged for NURSE_CHAT_ID).
+// Set explicitly, for polling too, so an older setting can't linger: Telegram remembers the last list.
+const WEBHOOK_UPDATES = ['message', 'edited_message', 'callback_query', 'my_chat_member'];
+
+// -> { mode: 'polling' } | { mode: 'webhook', url, secret } | { mode: 'refused', reason }
+// Read per call (not cached), so tests and ops can flip it live.
+export function webhookConfig(env = process.env) {
+  const raw = (env.TELEGRAM_WEBHOOK_URL ?? '').trim();
+  if (!raw) return { mode: 'polling' };
+  const refused = (reason) => ({ mode: 'refused', reason });
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    return refused('TELEGRAM_WEBHOOK_URL is not a valid URL');
+  }
+  if (url.protocol !== 'https:') return refused('TELEGRAM_WEBHOOK_URL must start with https:// (Telegram only calls HTTPS)');
+  if (url.pathname === '/') url.pathname = WEBHOOK_PATH; // a bare public base URL is enough
+  const secret = (env.TELEGRAM_WEBHOOK_SECRET ?? '').trim();
+  if (secret && !SECRET_FORMAT.test(secret)) return refused('TELEGRAM_WEBHOOK_SECRET may only contain A-Z a-z 0-9 _ and - (1 to 256 characters)');
+  // Fails closed: without a secret anyone who finds the URL could post updates as any patient.
+  if (!secret && env.NODE_ENV === 'production') return refused('TELEGRAM_WEBHOOK_SECRET is required in production');
+  return { mode: 'webhook', url: url.href, secret: secret || null };
+}
+
+// Telegram re-sends an update until it gets a 2xx, and again when the answer was slow.
+const seenUpdates = createDedupe({ ttlMs: 10 * 60_000 });
+
+// One webhook delivery -> { status, error? } for routes/webhooks.js.
+export async function handleWebhook(update, givenSecret) {
+  const hook = webhookConfig();
+  if (!bot || hook.mode === 'polling') return { status: 404, error: 'telegram webhook mode is off' };
+  if (hook.mode === 'refused') return { status: 403, error: 'telegram webhook is not configured' };
+  const authentic = !hook.secret || (typeof givenSecret === 'string' && sec.safeEqual(givenSecret, hook.secret));
+  if (!authentic) return { status: 403, error: 'invalid secret' };
+  if (!Number.isSafeInteger(update?.update_id)) return { status: 400, error: 'not a Telegram update' };
+  if (seenUpdates.seen(update.update_id)) return { status: 200, duplicate: true };
+  try {
+    await bot.handleUpdate(update);
+  } catch (err) {
+    // Acknowledged anyway, as polling does (b.catch): a 5xx would make Telegram re-send the same
+    // update into the same bug, and hold back that chat's later messages while it does.
+    console.error('[telegram] error:', scrub(err.error?.message ?? err));
+  }
+  return { status: 200 };
+}
+
+// Start receiving on a built bot. Split from start() so tests can drive it with a fake bot.
+export async function launch(b, hook = webhookConfig()) {
+  if (hook.mode === 'refused') {
+    receiving = 'refused';
+    console.error(`[telegram] webhook mode refused: ${hook.reason}. Incoming Telegram messages are OFF until this is fixed (sending and the dashboard still work).`);
+    return receiving;
+  }
+  if (hook.mode === 'webhook') {
+    try {
+      await b.init(); // handleUpdate needs the bot's identity; polling fetches it by itself
+      await b.api.setWebhook(hook.url, { ...(hook.secret && { secret_token: hook.secret }), allowed_updates: WEBHOOK_UPDATES });
+      receiving = 'webhook';
+      console.log(`[telegram] @${b.botInfo.username} webhook -> ${hook.url}`);
+      if (!hook.secret) console.warn('[telegram] TELEGRAM_WEBHOOK_SECRET is not set: webhook requests are not verified. Set it before exposing the server.');
+    } catch (err) {
+      receiving = 'failed';
+      console.error('[telegram] setWebhook failed (new messages arrive only if an earlier run registered this URL):', scrub(err));
+    }
+    return receiving;
+  }
+  receiving = 'polling';
+  // grammY removes any registered webhook before it polls, so switching back needs no cleanup.
+  b.start({ allowed_updates: WEBHOOK_UPDATES, onStart: (me) => console.log(`[telegram] @${me.username} polling`) }).catch((err) => {
+    receiving = 'failed'; // 409 (a second poller) or 401: nothing is coming in any more
+    console.error(describePollingError(err));
+  });
+  return receiving;
+}
+
+export async function start() {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) {
+    console.log('[telegram] TELEGRAM_BOT_TOKEN not set, bot disabled (dashboard still works).');
+    return;
+  }
+  bot = buildBot(token);
+  try {
+    await bot.api.setMyCommands(COMMANDS.en);
+    await bot.api.setMyCommands(COMMANDS.es, { language_code: 'es' });
+  } catch (err) {
+    console.error('[telegram] setMyCommands failed:', scrub(err));
+  }
+  await launch(bot);
+}
+
+// Shutdown. A registered webhook is left in place on purpose: Telegram then keeps what arrives
+// during a restart and delivers it when we are back. deleteWebhook: true really unregisters it.
+export async function stop({ deleteWebhook = false } = {}) {
+  if (!bot) return;
+  await bot.stop(); // no-op unless polling
+  if (deleteWebhook && receiving === 'webhook') {
+    await bot.api.deleteWebhook().catch((err) => console.error('[telegram] deleteWebhook failed:', scrub(err)));
+  }
+  receiving = 'off';
+}
