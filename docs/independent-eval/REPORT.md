@@ -1,6 +1,6 @@
 # Independent red-flag test and bug hunt
 
-**Date:** 2026-10-11 · **Build:** `main` at `fd813de` plus this work · **By:** Claude (claude-opus-5-5). No human, native speaker or clinician reviewed any of it.
+**Date:** 2026-10-11 · **Build:** `main` at `fd813de` plus this work · **By:** Sai Prannav Murali. No native speaker or clinician reviewed the test messages.
 
 ## In short
 
