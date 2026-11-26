@@ -61,9 +61,9 @@ The backend picks the first available provider: **Claude → Gemini → Ollama �
 
 | Area | Owner | Files |
 |---|---|---|
-| Telegram connection | Telegram teammate | `backend/src/channels/telegram.js`, see [docs/TELEGRAM_SETUP.md](docs/TELEGRAM_SETUP.md) |
+| Telegram connection | Channels owner | `backend/src/channels/telegram.js`, see [docs/TELEGRAM_SETUP.md](docs/TELEGRAM_SETUP.md) |
 | Core logic (check-in, triage, meds, pharmacy, caregiver, LLM chain) | Backend | `backend/src/core/*` |
-| Risk assessment | Risk teammate | `backend/src/core/risk.js`: keep the `scoreRisk(patient) → { score, tier, factors, plan }` contract |
+| Risk assessment | Risk owner | `backend/src/core/risk.js`: keep the `scoreRisk(patient) → { score, tier, factors, plan }` contract |
 | Dashboard | Backend | `frontend/src/*` |
 
 The contract between them is `handleInbound()` / `sendToChat()`, documented at the top of `backend/src/core/agent.js`.

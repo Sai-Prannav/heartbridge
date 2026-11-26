@@ -1,6 +1,6 @@
 process.env.LLM_PROVIDER = 'none';
 process.env.HEARTBRIDGE_DB = `${process.env.TEMP}/heartbridge-lab-verify1-${process.pid}.json`;
-const parser = await import('file:///D:/Personal-Projects/HackGT/backend/src/core/parser.js');
+const parser = await import('../../../backend/src/core/parser.js');
 const red = (t) => { const a = parser.parseFreeText(t); return !!(a.chestPain || a.breath === 'rest' || a.fainting || a.confusion || a.otherEmergency) ? 'RED' : 'calm'; };
 
 console.log('=== (a) the everyday "no X or Y" answer to the first check-in question, rules only ===');
@@ -16,5 +16,5 @@ for (const [l, t] of NEG) { const r = red(t); if (r === 'RED') falseRed++; conso
 console.log(`  -> ${falseRed}/${NEG.length} calm answers treated as a 911 emergency`);
 
 console.log('\n=== (c) which language text does the first-question "NONE" detection cover? (rules, step redflags) ===');
-const checkin = await import('file:///D:/Personal-Projects/HackGT/backend/src/core/checkin.js');
+const checkin = await import('../../../backend/src/core/checkin.js');
 console.log('exports:', Object.keys(checkin).join(', '));

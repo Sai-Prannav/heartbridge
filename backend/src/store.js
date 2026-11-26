@@ -295,6 +295,9 @@ export function addAlert({ patientId, tier, reasons, kind = 'triage', title, ...
   };
   db.alerts.unshift(alert);
   byPatient.alerts.added(alert, true);
+  // A RED alert is durable before anyone is answered: the 250 ms write batching (SAVE_DEBOUNCE_MS) would let a crash
+  // right after "call 911" lose the alert, the lock and the conversation (independent bug hunt, edge.mjs kill -9).
+  if (tier === 'RED') flush();
   emit('alert', alert);
   return alert;
 }

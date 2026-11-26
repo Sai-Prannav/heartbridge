@@ -5,8 +5,10 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
 
-export const BACKEND = 'D:/Personal-Projects/HackGT/backend';
+// this repo's backend (or HEARTBRIDGE_BACKEND, e.g. a worktree of another commit)
+export const BACKEND = process.env.HEARTBRIDGE_BACKEND ?? path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../../backend');
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 export async function startServer({ port = 3071, env = {}, label = 'srv' } = {}) {

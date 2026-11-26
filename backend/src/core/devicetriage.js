@@ -34,7 +34,8 @@ export async function ingestReading({ patientId, type, value, device, ts, readin
   if (readingId !== undefined && (typeof readingId !== 'string' || !readingId || readingId.length > 64)) return fail(400, 'readingId must be a string of 1-64 characters');
   let when;
   if (ts !== undefined) {
-    const ms = typeof ts === 'string' || typeof ts === 'number' ? Date.parse(typeof ts === 'number' ? new Date(ts).toISOString() : ts) : NaN;
+    // getTime(), not toISOString(): a number no Date can hold (1e308) gives NaN here instead of throwing a RangeError
+    const ms = typeof ts === 'number' ? new Date(ts).getTime() : typeof ts === 'string' ? Date.parse(ts) : NaN;
     if (!Number.isFinite(ms)) return fail(400, 'ts must be an ISO timestamp');
     if (ms > clock.now() + 5 * 60_000) return fail(400, 'ts is in the future');
     if (ms < clock.now() - MAX_PAST_MS) return fail(400, 'ts is more than 30 days old');

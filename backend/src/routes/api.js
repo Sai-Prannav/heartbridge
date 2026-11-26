@@ -13,6 +13,7 @@ import { startLadder } from '../core/outreach.js';
 import { sendNurseMessage, notifyAck, notifyAckMany } from '../core/nurse.js';
 import { buildDigest, sendDigest } from '../core/digest.js';
 import { startScreen } from '../core/sdoh.js';
+import { redLock } from '../core/escalation.js';
 import * as llm from '../core/llm/index.js';
 import * as clock from '../core/clock.js';
 import * as protocols from '../core/protocols.js';
@@ -276,6 +277,7 @@ api.post('/patients/:id/digest', async (req, res) => {
 api.post('/patients/:id/sdoh/start', async (req, res) => {
   try {
     const p = store.getPatient(req.params.id);
+    if (p && redLock(p)) return res.status(409).json({ error: 'RED lock: patient was told to call 911' });
     const replies = await startScreen(req.params.id);
     for (const r of replies) await channels.sendToPatient(store.getPatient(p.id), r);
     res.json({ sent: replies.length });
@@ -311,6 +313,8 @@ api.post('/devices/readings', async (req, res) => {
 api.post('/patients/:id/checkin', async (req, res) => {
   const p = store.getPatient(req.params.id);
   if (!p) return res.status(404).json({ error: 'not found' });
+  // nothing but "call 911" reaches a patient during the RED lock (the scheduler already skips; the nurse button did not)
+  if (redLock(p)) return res.status(409).json({ error: 'RED lock: patient was told to call 911' });
   const replies = await startCheckin(p.id);
   for (const r of replies) await channels.sendToPatient(p, r);
   startLadder(p, store.getPatient(p.id).checkin.startedAt); // silence after this escalates
