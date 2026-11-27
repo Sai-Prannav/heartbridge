@@ -424,8 +424,10 @@ async function finish(patient, a, traced = null) {
   const name = firstName(patient);
   const replies = [];
   if (result.tier === 'RED') {
-    const key = proxy ? 'proxy_red_911' : 'red_911';
-    replies.push({ ...replyIn(lang, key, { name, caregiver: patient.caregiver?.name?.split(' ')[0] ?? 'your family' }), urgent: true });
+    // never promise "your family" was alerted when no caregiver is on file (independent bug hunt)
+    const cg = patient.caregiver?.name?.split(' ')[0];
+    const key = proxy ? 'proxy_red_911' : cg ? 'red_911' : 'red_911_alone';
+    replies.push({ ...replyIn(lang, key, { name, caregiver: cg }), urgent: true });
     return replies;
   }
   const thanks = result.tier === 'YELLOW' ? 'thanks_yellow' : 'thanks_green';
@@ -507,7 +509,7 @@ export async function handleBloodPressure(patient, bp) {
 // A check-in button from an old message, tapped when no check-in is running. Returns urgent
 // replies if the tap itself is an emergency (chest pain, fainted, confused, breathless at rest),
 // else null so the caller offers a fresh check-in.
-export async function handleStaleTap(patient, data) {
+export async function handleStaleTap(patient, data, { lang, reporter } = {}) {
   const a = {};
   applyButton(a, data);
   const copd = copdOf(patient);
@@ -515,6 +517,6 @@ export async function handleStaleTap(patient, data) {
   const result = triage({ weights: patient.weights, answers: a, dryWeightLb: patient.dryWeightLb, copd });
   store.updatePatient(patient.id, { lastTier: result.tier });
   store.audit('stale_tap_emergency', patient.id, { data });
-  await escalate(store.getPatient(patient.id), result, { source: 'old button tap' });
-  return [{ ...replyIn(patient.language, 'red_interrupt', { name: firstName(patient) }), urgent: true }];
+  await escalate(store.getPatient(patient.id), result, { source: reporter === 'caregiver' ? 'old button tap (caregiver)' : 'old button tap' });
+  return [{ ...replyIn(lang ?? patient.language, 'red_interrupt', { name: firstName(patient) }), urgent: true }];
 }

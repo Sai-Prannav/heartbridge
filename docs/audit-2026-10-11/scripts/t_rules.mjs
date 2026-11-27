@@ -1,6 +1,6 @@
 process.env.LLM_PROVIDER = 'none';
 process.env.HEARTBRIDGE_DB = `${process.env.TEMP}/heartbridge-lab-rules-${process.pid}.json`;
-const parser = await import('file:///D:/Personal-Projects/HackGT/backend/src/core/parser.js');
+const parser = await import('../../../backend/src/core/parser.js');
 const { isEmergencyText } = { isEmergencyText: (t) => { const a = parser.parseFreeText(t); return !!(a.chestPain || a.breath === 'rest' || a.fainting || a.confusion || a.otherEmergency); } };
 
 const rows = [];

@@ -69,6 +69,6 @@ Big telemonitoring trials (Tele-HF, BEAT-HF) showed **no readmission benefit**, 
 | Owner | Scope |
 |---|---|
 | Prannav + Claude | core engine, LLM chain, scheduler/meds/pharmacy/outreach, companion, condition packs, integrations, evals |
-| Telegram teammate | `backend/src/channels/*`: Telegram UX, judge enrollment, voice, then SMS/WhatsApp |
-| Risk teammate | `backend/src/core/risk.js` (keep the `scoreRisk` contract), risk validation, impact/ROI analytics |
-| 4th / shared | dashboard UX, pitch deck, demo video, clinician outreach |
+| Channels owner | `backend/src/channels/*`: Telegram UX, judge enrollment, voice, then SMS/WhatsApp |
+| Risk owner | `backend/src/core/risk.js` (keep the `scoreRisk` contract), risk validation, impact/ROI analytics |
+| Shared | dashboard UX, pitch deck, demo video, clinician outreach |

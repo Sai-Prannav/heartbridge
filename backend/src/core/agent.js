@@ -216,6 +216,8 @@ async function processInbound({ patientId, role = 'patient', channel, text, butt
   if (patient.voiceMode && role === 'patient') replies = replies.map((r) => ({ ...r, voice: true }));
   const to = role === 'caregiver' ? 'caregiver' : 'patient';
   for (const r of replies) store.addMessage({ patientId, direction: 'out', to, text: r.text, textEn: r.textEn, buttons: r.buttons, channel });
+  // an urgent answer ("call 911") is on disk with everything that led to it before the channel sends it
+  if (replies.some((r) => r.urgent)) store.flush();
   return replies;
 }
 
@@ -282,6 +284,11 @@ async function handleCaregiver(patient, { input, buttonData, injection = false }
   }
   if (checkin.reporterOf(patient) === 'caregiver' && (input || buttonData?.startsWith('ci:'))) {
     return checkin.handle(patient, { text: input, buttonData });
+  }
+  // an old check-in button the caregiver taps ("chest pain") is an emergency exactly as the patient's tap is (CONTRACTS.md)
+  if (buttonData?.startsWith('ci:') && !checkin.isActive(patient)) {
+    const urgent = await checkin.handleStaleTap(patient, buttonData, { lang: cgLang, reporter: 'caregiver' });
+    if (urgent) return { replies: urgent };
   }
   if (input) {
     const urgent = await checkin.handleUrgentFreeText(patient, input, { reporter: 'caregiver', lang: cgLang });

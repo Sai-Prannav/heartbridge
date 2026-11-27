@@ -35,7 +35,7 @@ npm run check      # tests + frontend build (run before every push)
 npm run e2e        # full demo story over HTTP with a readable step log (also runs inside npm test)
 npm run seed       # reset demo data
 ```
-Optional AI: the chain is Claude → Ollama → LM Studio → rules, picked automatically (`backend/src/core/llm/`). See the README for setup.
+Optional AI: the chain is Claude → Gemini → Ollama → LM Studio → rules, picked automatically (`backend/src/core/llm/`). See the README for setup.
 
 ## 5. Never
 - Commit `.env`, tokens or real patient data. All demo data is synthetic.

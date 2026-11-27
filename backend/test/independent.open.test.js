@@ -1,7 +1,6 @@
-// Open bugs found by the independent bug hunt (docs/independent-eval/REPORT.md), tracked here
-// instead of fixed yet. Each test below
-// FAILS today and is marked `todo`: it runs on every `npm test` and shows up in the summary, without
-// turning the suite red. Whoever fixes one removes its `todo` line; the test then guards the fix.
+// Bugs found by the independent bug hunt (docs/independent-eval/REPORT.md). They were tracked here as
+// `todo` tests until fixed (2026-11-26: all six fixed, including the one that could lose a RED alert);
+// each test now guards its fix. A new open bug gets a test here marked `{ todo: OPEN }` until it is fixed.
 import { test, before, beforeEach, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -32,7 +31,7 @@ const call = async (method, p, body) => {
 const OPEN = 'open bug from the independent bug hunt (docs/independent-eval/REPORT.md)';
 
 // core/enroll.js: one malformed POST takes the worklist down for every nurse.
-test('POST /api/patients refuses weights / prescriptions / meds that are not lists', { todo: OPEN }, async () => {
+test('POST /api/patients refuses weights / prescriptions / meds that are not lists', async () => {
   for (const field of ['weights', 'prescriptions', 'meds']) {
     for (const bad of ['', true, { length: 3 }]) {
       const made = await call('POST', '/api/patients', { name: 'Bad Shape', [field]: bad });
@@ -47,7 +46,7 @@ test('POST /api/patients refuses weights / prescriptions / meds that are not lis
 });
 
 // routes/api.js: the dashboard's "start check-in" and "social-needs screen" ignore the RED lock.
-test('nothing but "call 911" reaches a patient during the RED lock, even when a nurse presses "start check-in"', { todo: OPEN }, async () => {
+test('nothing but "call 911" reaches a patient during the RED lock, even when a nurse presses "start check-in"', async () => {
   await agent.handleInbound({ patientId: 'p1', channel: 'sim', text: 'me duele mucho el pecho' });
   const out = () => store.listMessages('p1').filter((m) => m.direction === 'out' && m.to === 'patient').length;
   const before = out();
@@ -59,14 +58,14 @@ test('nothing but "call 911" reaches a patient during the RED lock, even when a 
 });
 
 // core/agent.js handleCaregiver: CONTRACTS.md says an old "chest pain" tap is still an emergency.
-test('a caregiver tapping "chest pain" on an old check-in message raises a RED alert, like the patient\'s tap does', { todo: OPEN }, async () => {
+test('a caregiver tapping "chest pain" on an old check-in message raises a RED alert, like the patient\'s tap does', async () => {
   const replies = await agent.handleInbound({ patientId: 'p1', role: 'caregiver', channel: 'sim', buttonData: 'ci:rf:chest' });
   assert.equal(store.listAlerts('p1').filter((a) => a.tier === 'RED').length, 1);
   assert.ok(replies[0].urgent);
 });
 
 // core/checkin.js finish(): "your family" is promised (in English, inside any language) with no caregiver on file.
-test('the 911 message does not say the family was alerted when the patient has no caregiver', { todo: OPEN }, async () => {
+test('the 911 message does not say the family was alerted when the patient has no caregiver', async () => {
   const made = await call('POST', '/api/patients', { name: 'Ann Alone', language: 'en' });
   const id = made.json.id;
   await agent.handleInbound({ patientId: id, channel: 'sim', buttonData: 'cmd:checkin' });
@@ -76,14 +75,14 @@ test('the 911 message does not say the family was alerted when the patient has n
 });
 
 // core/devicetriage.js: a numeric ts no Date can hold throws instead of answering 400.
-test('POST /api/devices/readings answers 400 for a timestamp no calendar can hold', { todo: OPEN }, async () => {
+test('POST /api/devices/readings answers 400 for a timestamp no calendar can hold', async () => {
   const res = await call('POST', '/api/devices/readings', { patientId: 'p1', type: 'weight', value: 170, ts: 1e308 });
   assert.equal(res.status, 400);
 });
 
 // store.js: writes are held back 250 ms, so a crash right after "call 911" loses the RED alert,
 // the lock and the conversation (docs/independent-eval/edge.mjs shows it with a real kill -9).
-test('a RED alert is on disk before the patient is answered (a crash in the next 250 ms must not lose it)', { todo: OPEN }, async () => {
+test('a RED alert is on disk before the patient is answered (a crash in the next 250 ms must not lose it)', async () => {
   await agent.handleInbound({ patientId: 'p1', channel: 'sim', text: 'me duele mucho el pecho' });
   const onDisk = fs.existsSync(process.env.HEARTBRIDGE_DB) ? JSON.parse(fs.readFileSync(process.env.HEARTBRIDGE_DB, 'utf8')) : { alerts: [] };
   assert.equal(onDisk.alerts.filter((a) => a.patientId === 'p1' && a.tier === 'RED').length, 1);

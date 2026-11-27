@@ -42,6 +42,10 @@ function uniqueCode(prefix, len = 6) {
 // Anything missing gets a sensible CHF default; baseline risk is computed by makePatient.
 export function createPatient(data) {
   if (!data?.name) throw new Error('createPatient: name is required');
+  // a non-list here was stored as-is and broke GET /api/patients and the impact report for every nurse
+  for (const field of ['weights', 'prescriptions', 'meds']) {
+    if (data[field] !== undefined && !Array.isArray(data[field])) throw new Error(`createPatient: ${field} must be a list`);
+  }
   const id = data.id ?? `p_${shortId().toLowerCase()}`;
   if (store.getPatient(id)) throw new Error(`createPatient: id ${id} already exists`);
   const template = buildSeed().patients.find((p) => p.id === 'p2'); // generic defaults

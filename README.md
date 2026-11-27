@@ -33,7 +33,7 @@ No keys are needed to start. Without a Telegram token you can chat as a patient 
 
 ## Status
 
-- Checked 2026-11-24: backend 1213 tests (1207 pass, 6 todo, 0 fail), frontend 129 pass, frontend build ok, e2e 19/19.
+- Checked 2026-11-26: backend 1214 tests (all pass, 0 todo: the six open bugs from the independent bug hunt are fixed, including the one that could lose a RED alert), frontend 129 pass, frontend build ok, e2e 19/19. CI also holds the independent eval's 40.8% rules-only recall floor.
 - `npm audit` flags 2 backend dependency advisories (body-parser high, qs moderate); `npm audit fix` is available.
 - **No license chosen yet.** All rights reserved until one is added.
 - **Not clinical software.** A hackathon prototype, never validated with patients or clinicians. Do not use it for real patient care.
